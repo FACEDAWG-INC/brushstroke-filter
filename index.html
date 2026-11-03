@@ -1,0 +1,903 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Brushstroke Filter</title>
+<style>
+  /* Layout: full-bleed glyph grid, one control bar pinned to the bottom,
+     a drop target that covers the grid until a clip is loaded.
+     Committed single dark theme — this is a viewing surface for video. */
+  :root {
+    color-scheme: dark;
+    --ink:    #06070b;   /* ground behind the glyphs */
+    --panel:  #0c0e14;   /* control bar */
+    --line:   #232834;
+    --fg:     #ccd4e4;
+    --dim:    #6a7488;
+    --accent: #d8a24a;   /* ochre: the one warm note against the grid */
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--fg);
+    font-family: var(--mono);
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: var(--ink);
+    touch-action: none;
+  }
+
+  /* ---- drop target, shown until a clip is open ---- */
+  #drop {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    text-align: center;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 24px 96px;
+    background: radial-gradient(60% 55% at 50% 45%, rgba(6,7,11,.55), rgba(6,7,11,.9));
+    transition: opacity .45s ease;
+    overflow-y: auto;
+  }
+  @media (max-height: 470px) {
+    #drop { gap: 10px; padding-block: 14px 84px; }
+    #drop h1 { font-size: 13px; letter-spacing: .2em; }
+    #drop p { font-size: 11px; line-height: 1.6; }
+  }
+  #drop.gone { opacity: 0; pointer-events: none; }
+  #drop.over { background: radial-gradient(60% 55% at 50% 45%, rgba(216,162,74,.12), rgba(6,7,11,.92)); }
+  #drop h1 {
+    margin: 0;
+    font-size: clamp(15px, 2.4vw, 21px);
+    font-weight: 500;
+    letter-spacing: .26em;
+    text-transform: uppercase;
+    text-wrap: balance;
+  }
+  #drop p {
+    margin: 0;
+    max-width: 46ch;
+    font-size: 12px;
+    line-height: 1.8;
+    color: var(--dim);
+  }
+  #drop .rule {
+    width: 44px; height: 1px; background: var(--accent); opacity: .7;
+  }
+  #drop .row { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+
+  button, .btn {
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid var(--line);
+    padding: 9px 16px;
+    cursor: pointer;
+  }
+  button:hover, .btn:hover { border-color: var(--accent); color: var(--accent); }
+  button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #open { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- control bar ---- */
+  #bar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 18px;
+    background: linear-gradient(to top, var(--panel), rgba(12,14,20,.72));
+    border-top: 1px solid var(--line);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 10px calc(10px + env(safe-area-inset-bottom, 0px));
+    font-size: 10px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--dim);
+    transition: opacity .4s ease;
+  }
+  #bar.hidden { opacity: 0; pointer-events: none; }
+  #bar .grp { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  #bar .spacer { flex: 1 1 auto; }
+  #name {
+    color: var(--fg);
+    text-transform: none;
+    letter-spacing: .04em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 30ch;
+    min-width: 0;
+  }
+  input[type="range"] {
+    accent-color: var(--accent);
+    width: 92px;
+    height: 18px;
+    cursor: pointer;
+  }
+  input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  /* The source video must stay in the rendering tree: display:none lets the
+     browser stop producing frames, and drawImage then copies nothing. Keep
+     it laid out, just tiny and invisible. */
+  #vid {
+    position: fixed;
+    left: 0; bottom: 0;
+    width: 2px; height: 2px;
+    opacity: 0.01;
+    pointer-events: none;
+    z-index: -1;
+  }
+  #diag {
+    color: var(--dim);
+    text-transform: none;
+    letter-spacing: .04em;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .val { color: var(--fg); font-variant-numeric: tabular-nums; min-width: 3ch; }
+
+  @media (max-width: 620px) {
+    #bar { font-size: 9px; letter-spacing: .08em; gap: 8px 12px; }
+    #bar .spacer { display: none; }
+    #name { max-width: 100%; flex-basis: 100%; order: -1; }
+    input[type="range"] { width: 70px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #drop, #bar { transition: none; }
+  }
+</style>
+
+<canvas id="stage" aria-label="Video rendered as colored monospace characters"></canvas>
+
+<div id="drop">
+  <h1>Brushstroke Filter</h1>
+  <div class="rule"></div>
+  <p>
+    Drop a video here, or open one. Every frame is redrawn as a grid of
+    monospace characters: the glyph points along the brushstroke, the colour
+    is sampled per character. Strokes follow edges in your footage, warped by
+    a field of slow vortices.
+  </p>
+  <div class="row">
+    <button id="open" type="button">Open a video</button>
+    <button id="camOpen" type="button" hidden>Use camera</button>
+  </div>
+  <p>Nothing is uploaded. The file is read and played in this page only.</p>
+</div>
+
+<div id="bar">
+  <div class="grp"><button id="pick" type="button">Open</button></div>
+  <div class="grp"><button id="cam" type="button" hidden>Camera</button></div>
+  <div class="grp"><button id="flip" type="button" hidden>Flip</button></div>
+  <div class="grp"><button id="play" type="button">Pause</button></div>
+  <div class="grp">
+    <label for="mix">Swirl</label>
+    <input id="mix" type="range" min="0" max="100" value="35">
+    <span class="val" id="mixv">35</span>
+  </div>
+  <div class="grp">
+    <label for="sat">Colour</label>
+    <input id="sat" type="range" min="0" max="250" value="145">
+    <span class="val" id="satv">145</span>
+  </div>
+  <div class="grp">
+    <label for="den">Detail</label>
+    <input id="den" type="range" min="60" max="170" value="100">
+    <span class="val" id="denv">100</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="grp" id="name">no clip — showing test pattern</div>
+  <div class="grp" id="diag">pattern</div>
+</div>
+
+<input id="file" type="file" accept="video/*" hidden>
+<video id="vid" playsinline muted loop></video>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =====================================================================
+     Video -> brushstrokes made of text.
+
+     Per frame the clip is drawn into a small sampling canvas at twice the
+     character grid, and read back once.  From the luminance we build a
+     structure tensor: smoothed, its minor eigenvector points ALONG edges,
+     which is the direction a painter's stroke would take.  That direction
+     is blended with a field of slow vortices, weighted by how coherent the
+     local image structure is -- detailed areas follow the footage, flat
+     areas swirl.  A short line integral convolution along the blended
+     field smears luminance and colour into strokes.
+
+     Direction picks one of four glyph ramps, brightness picks the step
+     along it, and the colour of each character is sampled from the frame.
+     ===================================================================== */
+
+  var MONO = 'ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace';
+
+  /* ---------------------------------------------------- glyph ramps */
+  /* ported from the Starry Night piece: one density ramp per direction,
+     so a stroke can darken without losing the angle it points. */
+  var RAMP_SRC = {
+    h: " .,_-~=+*wm#@",            /* horizontal  --- */
+    v: " .:;i!|I()[]1tfj#@",       /* vertical    ||| */
+    a: " .'/7xX%&#@",              /* up-right    /// */
+    b: " .`\\xX%&#@",              /* down-right  \\\ */
+    s: " .:+*oO08&#@"              /* round, for highlights */
+  };
+
+  var GLYPHS = '';
+  (function () {
+    var all = RAMP_SRC.h + RAMP_SRC.v + RAMP_SRC.a + RAMP_SRC.b + RAMP_SRC.s;
+    for (var i = 0; i < all.length; i++) {
+      if (GLYPHS.indexOf(all.charAt(i)) < 0) GLYPHS += all.charAt(i);
+    }
+  })();
+
+  var G = {};
+  for (var gi = 0; gi < GLYPHS.length; gi++) G[GLYPHS.charAt(gi)] = gi;
+
+  function toIdx(s) {
+    var a = new Int16Array(s.length);
+    for (var i = 0; i < s.length; i++) a[i] = G[s.charAt(i)];
+    return a;
+  }
+  var RH = toIdx(RAMP_SRC.h), RV = toIdx(RAMP_SRC.v), RA = toIdx(RAMP_SRC.a),
+      RB = toIdx(RAMP_SRC.b), RS = toIdx(RAMP_SRC.s);
+
+  function pick(ramp, b) {
+    var i = (b * ramp.length) | 0;
+    return ramp[i < 0 ? 0 : (i >= ramp.length ? ramp.length - 1 : i)];
+  }
+
+  function glyphFor(dx, dy, b, hv) {
+    var bb = b + (hv - 0.5) * 0.07;
+    bb = bb * (0.78 + 0.22 * bb);          /* nearly linear: unlike the
+                                              painting, video brings its
+                                              own luminance range */
+    if (bb > 0.90) return pick(RS, (bb - 0.90) * 10);
+    var a = Math.atan2(dy, dx);
+    if (a < 0) a += Math.PI;
+    switch (Math.round(a / (Math.PI / 4)) & 3) {
+      case 0: return pick(RH, bb);
+      case 1: return pick(RB, bb);
+      case 2: return pick(RV, bb);
+      default: return pick(RA, bb);
+    }
+  }
+
+  /* ------------------------------------------------- colour + atlas */
+  /* Colour is applied by multiplying, not by a palette.  The glyphs are
+     drawn white on black, then one scaled multiply pass lays a per-cell
+     colour image over them: white glyph x colour = colour, black ground
+     stays black.  Exact 24-bit colour per character, and the atlas holds
+     one copy of each glyph instead of one per palette entry.
+     (A 6x6x6 cube was the first attempt.  It quantises chroma in steps of
+     51, so walls, hair, anything near neutral landed on exactly grey —
+     most of a camera frame turned black and white.) */
+
+  /* Characters cover maybe a fifth of their cell, so the eye averages every
+     sampled colour with the black behind it.  Lift before quantising, or
+     the result reads several stops darker than the clip. */
+  var LIFT = new Uint8Array(256);
+  for (var li = 0; li < 256; li++) LIFT[li] = Math.round(255 * Math.pow(li / 255, 0.72));
+
+  var cvs = document.getElementById('stage');
+  var ctx = cvs.getContext('2d', { alpha: false });
+  var atlas = document.createElement('canvas');
+  var actx = atlas.getContext('2d');
+
+  var DPR = 1, TW = 8, TH = 14, COLS = 0, ROWS = 0;
+  var chBuf = null;
+
+  function buildAtlas() {
+    atlas.width = TW;
+    atlas.height = TH * GLYPHS.length;
+    var fs = TH;
+    actx.font = fs + 'px ' + MONO;
+    var adv = actx.measureText('M').width || fs * 0.6;
+    fs = Math.max(5, Math.min(TH, Math.floor(fs * (TW / adv) * 0.99)));
+    actx.clearRect(0, 0, atlas.width, atlas.height);
+    actx.font = fs + 'px ' + MONO;
+    actx.textAlign = 'center';
+    actx.textBaseline = 'middle';
+    actx.fillStyle = '#fff';
+    for (var g = 1; g < GLYPHS.length; g++) {
+      var ch = GLYPHS.charAt(g);
+      /* twice, so small glyphs keep their weight instead of washing out */
+      actx.fillText(ch, TW * 0.5, g * TH + TH * 0.52);
+      actx.fillText(ch, TW * 0.5, g * TH + TH * 0.52);
+    }
+  }
+
+  function hash2(ix, iy) {
+    var n = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263)) | 0;
+    n = (n ^ (n >> 13)) | 0;
+    n = Math.imul(n, 1274126177) | 0;
+    n = (n ^ (n >> 16)) | 0;
+    return (n >>> 0) / 4294967295;
+  }
+
+  /* --------------------------------------------- sampling buffers */
+  var scan = document.createElement('canvas');
+  var sctx = scan.getContext('2d', { alpha: false, willReadFrequently: true });
+  var SX = 0, SY = 0;
+  var src = null;                      /* RGBA of the sampled frame */
+  var lum = null;                      /* luminance 0..1 */
+  var Jxx = null, Jyy = null, Jxy = null, tmp = null;
+
+  function allocSample() {
+    SX = Math.max(8, COLS * 2);
+    SY = Math.max(8, ROWS * 2);
+    scan.width = SX;
+    scan.height = SY;
+    var n = SX * SY;
+    src = new Uint8ClampedArray(n * 4);
+    lum = new Float32Array(n);
+    Jxx = new Float32Array(n);
+    Jyy = new Float32Array(n);
+    Jxy = new Float32Array(n);
+    tmp = new Float32Array(n);
+  }
+
+  /* ------------------------------------------------- vortex field */
+  /* wide and overlapping, so there is rotation everywhere rather than a
+     few eddies adrift in a horizontal current */
+  var VORTS = [
+    { x: 0.30, y: 0.32, s: 0.42, w:  1.00 },
+    { x: 0.70, y: 0.60, s: 0.38, w: -0.90 },
+    { x: 0.82, y: 0.20, s: 0.32, w:  0.75 },
+    { x: 0.18, y: 0.74, s: 0.34, w: -0.70 },
+    { x: 0.50, y: 0.50, s: 0.30, w:  0.55 }
+  ];
+  var vfx = 1, vfy = 0;
+
+  function vortexAt(u, v, t) {
+    var ax = 0.10, ay = 0;
+    for (var i = 0; i < VORTS.length; i++) {
+      var q = VORTS[i];
+      var dx = u - q.x, dy = v - q.y;
+      var r2 = (dx * dx + dy * dy) / (2 * q.s * q.s);
+      if (r2 > 6.5) continue;
+      var f = Math.exp(-r2) * q.w / q.s;
+      ax -= dy * f;
+      ay += dx * f;
+    }
+    ax += 0.35 * Math.sin(v * 6.1 + t * 0.26);
+    ay += 0.28 * Math.sin(u * 5.3 - t * 0.21);
+    var m = Math.sqrt(ax * ax + ay * ay) || 1;
+    vfx = ax / m; vfy = ay / m;
+  }
+
+  /* ------------------------------------------------ frame sources */
+  var vid = document.getElementById('vid');
+  var hasClip = false;
+  var camStream = null;
+  var facing = 'user';      /* front camera first; Flip swaps to the rear */
+
+  function fillFromVideo() {
+    var vw = vid.videoWidth, vh = vid.videoHeight;
+    if (!vw || !vh) return false;
+    /* mirror the front camera only: a self-view should read the right way
+       round, but the rear camera is already looking the way you are */
+    var mirror = !!camStream && facing === 'user';
+    /* contain-fit, corrected for the cell's 0.58 aspect so the clip keeps
+       its own shape once it lands on a grid of tall thin characters */
+    var want = (vw / vh) * (TH / TW);
+    var dw, dh;
+    if (SX / SY > want) { dh = SY; dw = SY * want; }
+    else { dw = SX; dh = SX / want; }
+    sctx.fillStyle = '#000';
+    sctx.fillRect(0, 0, SX, SY);
+    try {
+      if (mirror) {
+        sctx.save();
+        sctx.translate(SX, 0);
+        sctx.scale(-1, 1);
+        sctx.drawImage(vid, (SX - dw) / 2, (SY - dh) / 2, dw, dh);
+        sctx.restore();
+      } else {
+        sctx.drawImage(vid, (SX - dw) / 2, (SY - dh) / 2, dw, dh);
+      }
+    } catch (e) {
+      return false;            /* nothing decodable this frame */
+    }
+    src.set(sctx.getImageData(0, 0, SX, SY).data);
+    return true;
+  }
+
+  /* Until a clip is open the same pipeline runs on a test pattern, so the
+     page shows what it does instead of an empty frame.  Hard-edged shapes
+     on a soft ground on purpose: the edges give the stroke field something
+     real to follow, the flat interiors fall to the swirl, and together
+     they show the blend doing its job. */
+  var PAT = [
+    { c: '#e0a84e', r: 0.20, a: 0.00, sx: 0.26, sy: 0.17, w: 0.31 },
+    { c: '#4fa9a0', r: 0.15, a: 1.90, sx: 0.22, sy: 0.25, w: -0.24 },
+    { c: '#c2576b', r: 0.12, a: 3.60, sx: 0.30, sy: 0.14, w: 0.19 },
+    { c: '#7d86c9', r: 0.17, a: 5.10, sx: 0.18, sy: 0.27, w: -0.15 }
+  ];
+
+  function fillPlaceholder(t) {
+    var g = sctx.createLinearGradient(0, 0, SX, SY);
+    g.addColorStop(0, '#11161f');
+    g.addColorStop(0.5, '#1d2432');
+    g.addColorStop(1, '#0d1118');
+    sctx.fillStyle = g;
+    sctx.fillRect(0, 0, SX, SY);
+
+    var m = Math.min(SX, SY);
+    for (var i = 0; i < PAT.length; i++) {
+      var p = PAT[i];
+      var cx = SX * (0.5 + p.sx * Math.cos(t * p.w + p.a));
+      var cy = SY * (0.5 + p.sy * Math.sin(t * p.w * 1.3 + p.a));
+      sctx.fillStyle = p.c;
+      sctx.beginPath();
+      sctx.arc(cx, cy, p.r * m, 0, Math.PI * 2);
+      sctx.fill();
+    }
+
+    /* a slow bar sweep, for long straight edges at changing angles */
+    sctx.save();
+    sctx.translate(SX * 0.5, SY * 0.5);
+    sctx.rotate(t * 0.12);
+    sctx.fillStyle = 'rgba(232,236,245,0.85)';
+    sctx.fillRect(-SX * 0.46, -m * 0.035, SX * 0.92, m * 0.07);
+    sctx.restore();
+
+    src.set(sctx.getImageData(0, 0, SX, SY).data);
+  }
+
+  /* ------------------------------------ luminance + structure tensor */
+  function analyse() {
+    var n = SX * SY, i;
+    for (i = 0; i < n; i++) {
+      var p = i * 4;
+      lum[i] = (src[p] * 0.299 + src[p + 1] * 0.587 + src[p + 2] * 0.114) / 255;
+    }
+    /* Sobel, then the tensor of the gradient */
+    for (var y = 1; y < SY - 1; y++) {
+      var row = y * SX;
+      for (var x = 1; x < SX - 1; x++) {
+        var o = row + x;
+        var tl = lum[o - SX - 1], tc = lum[o - SX], tr = lum[o - SX + 1];
+        var ml = lum[o - 1], mr = lum[o + 1];
+        var bl = lum[o + SX - 1], bc = lum[o + SX], br = lum[o + SX + 1];
+        var gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+        var gy = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+        Jxx[o] = gx * gx;
+        Jyy[o] = gy * gy;
+        Jxy[o] = gx * gy;
+      }
+    }
+    blur(Jxx); blur(Jyy); blur(Jxy);
+
+    /* What counts as "an edge" depends on the clip: a soft, low-contrast
+       shot and a crisp one have gradient energies orders of magnitude
+       apart.  Measure this frame's own mean and judge cells against it. */
+    var s = 0, sl = 0, sq = 0;
+    for (i = 0; i < n; i++) { s += Jxx[i] + Jyy[i]; sl += lum[i]; sq += lum[i] * lum[i]; }
+    meanTr = s / n + 1e-9;
+    meanL = sl / n;
+    /* spread, so exposure can be normalised: a dim clip pinned to its own
+       mean would render as a handful of marks on black */
+    sdL = Math.sqrt(Math.max(1e-6, sq / n - meanL * meanL));
+    sdc = sdL < 0.02 ? 0 : Math.max(0.05, Math.min(0.30, sdL));
+  }
+  var meanTr = 1e-9, meanL = 0.5, sdL = 0.25, sdc = 0.25;
+
+  /* separable box blur, radius 2 — smooths the orientation field so the
+     strokes read as brushwork instead of per-pixel noise */
+  function blur(a) {
+    var x, y, o, s;
+    for (y = 0; y < SY; y++) {
+      var row = y * SX;
+      for (x = 0; x < SX; x++) {
+        s = 0;
+        for (var k = -2; k <= 2; k++) {
+          var xx = x + k;
+          s += a[row + (xx < 0 ? 0 : xx >= SX ? SX - 1 : xx)];
+        }
+        tmp[row + x] = s * 0.2;
+      }
+    }
+    for (x = 0; x < SX; x++) {
+      for (y = 0; y < SY; y++) {
+        s = 0;
+        for (var j = -2; j <= 2; j++) {
+          var yy = y + j;
+          s += tmp[(yy < 0 ? 0 : yy >= SY ? SY - 1 : yy) * SX + x];
+        }
+        a[y * SX + x] = s * 0.2;
+      }
+    }
+  }
+
+  function lumAt(x, y) {
+    var ix = x | 0, iy = y | 0;
+    if (ix < 0) ix = 0; else if (ix > SX - 2) ix = SX - 2;
+    if (iy < 0) iy = 0; else if (iy > SY - 2) iy = SY - 2;
+    var fx = x - ix, fy = y - iy;
+    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
+    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
+    var o = iy * SX + ix;
+    var t = lum[o] + (lum[o + 1] - lum[o]) * fx;
+    var b = lum[o + SX] + (lum[o + SX + 1] - lum[o + SX]) * fx;
+    return t + (b - t) * fy;
+  }
+
+  /* ------------------------------------------------------- render */
+  var LIC = 7, MIX = 0.35, SAT = 1.45;
+  var T = 0;
+
+  /* one pixel per character cell; scaled up over the glyphs */
+  var colc = document.createElement('canvas');
+  var cctx = colc.getContext('2d', { alpha: false, willReadFrequently: true });
+  var cimg = null, cdat = null;
+
+  function render() {
+    analyse();
+
+    var k = 0, iSX = 1 / SX, iSY = 1 / SY;
+    for (var cy = 0; cy < ROWS; cy++) {
+      var sy = cy * 2 + 1;
+      for (var cx = 0; cx < COLS; cx++, k++) {
+        var sx = cx * 2 + 1;
+        var o = sy * SX + sx;
+
+        /* stroke direction: along the edge, i.e. the tensor's minor axis */
+        var jxx = Jxx[o], jyy = Jyy[o], jxy = Jxy[o];
+        var th = 0.5 * Math.atan2(2 * jxy, jxx - jyy);     /* gradient */
+        var tx = -Math.sin(th), ty = Math.cos(th);          /* tangent */
+
+        /* Coherence alone is not enough: a faint, clean gradient scores as
+           highly coherent while its direction is meaningless.  Gate it on
+           gradient strength too, so only real edges steer the stroke. */
+        var tr = jxx + jyy;
+        var coh = tr > 1e-6
+          ? Math.sqrt((jxx - jyy) * (jxx - jyy) + 4 * jxy * jxy) / tr
+          : 0;
+        coh *= tr / (tr + 0.9 * meanTr);
+
+        vortexAt(sx * iSX, sy * iSY, T);
+        /* the tangent is an orientation, not an arrow: flip it into the
+           vortex's half-plane before the two are mixed */
+        if (tx * vfx + ty * vfy < 0) { tx = -tx; ty = -ty; }
+        /* flat areas have no reliable direction, so let the swirl lead */
+        var m = MIX + (1 - coh) * (1 - MIX) * 0.85;
+        var dx = tx * (1 - m) + vfx * m;
+        var dy = ty * (1 - m) + vfy * m;
+        var dm = Math.sqrt(dx * dx + dy * dy) || 1;
+        dx /= dm; dy /= dm;
+
+        /* smear luminance along the stroke */
+        var px = sx, py = sy, acc = 0, wsum = 0;
+        for (var i = 0; i < LIC; i++) {
+          var w = 1 - i / LIC;
+          acc += lumAt(px, py) * w;
+          wsum += w;
+          px -= dx; py -= dy;
+        }
+        /* Auto-level against this frame's own mean and spread.  The old
+           fixed gain was the bug behind "nothing really shows": real
+           footage is low-contrast, so every cell landed in a narrow dark
+           band of the ramp and the whole frame came out faint and flat.
+           sdc is clamped so a nearly-flat frame isn't amplified into
+           noise, and left at 0 for a black frame, which stays black. */
+        var b = acc / wsum;
+        if (sdc > 0) b = 0.5 + (b - meanL) / (2.6 * sdc);
+        if (b < 0) b = 0; else if (b > 1) b = 1;
+        b = Math.pow(b, 0.82);                      /* match the colour lift */
+        b = 0.05 + 0.95 * b;                        /* shadows keep a mark;
+                                                       true black stays empty */
+
+        /* colour: this cell, nudged along the stroke so it smears too */
+        var p0 = o * 4;
+        var o1 = (((sy - dy * 2) | 0) * SX + ((sx - dx * 2) | 0)) * 4;
+        if (o1 < 0 || o1 > src.length - 4) o1 = p0;
+        var r0 = (src[p0] * 2 + src[o1]) / 3;
+        var g0 = (src[p0 + 1] * 2 + src[o1 + 1]) / 3;
+        var b0 = (src[p0 + 2] * 2 + src[o1 + 2]) / 3;
+        /* camera footage is mostly low-chroma; push it away from grey
+           before the lift, or the result reads as black and white */
+        var yl = 0.299 * r0 + 0.587 * g0 + 0.114 * b0;
+        r0 = yl + (r0 - yl) * SAT;
+        g0 = yl + (g0 - yl) * SAT;
+        b0 = yl + (b0 - yl) * SAT;
+
+        var ci = k * 4;
+        cdat[ci]     = LIFT[r0 < 0 ? 0 : r0 > 255 ? 255 : r0 | 0];
+        cdat[ci + 1] = LIFT[g0 < 0 ? 0 : g0 > 255 ? 255 : g0 | 0];
+        cdat[ci + 2] = LIFT[b0 < 0 ? 0 : b0 > 255 ? 255 : b0 | 0];
+        cdat[ci + 3] = 255;
+
+        chBuf[k] = glyphFor(dx, dy, b, hash2(cx * 7 + 11, cy * 13 + 5));
+      }
+    }
+
+    /* pass 1: the glyphs, white on black */
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cvs.width, cvs.height);
+    k = 0;
+    for (var y = 0; y < ROWS; y++) {
+      var yy = y * TH;
+      for (var x = 0; x < COLS; x++, k++) {
+        var gl = chBuf[k];
+        if (gl === 0) continue;
+        ctx.drawImage(atlas, 0, gl * TH, TW, TH, x * TW, yy, TW, TH);
+      }
+    }
+
+    /* pass 2: multiply each cell by its own colour */
+    cctx.putImageData(cimg, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.drawImage(colc, 0, 0, COLS, ROWS, 0, 0, COLS * TW, ROWS * TH);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ------------------------------------------------------- sizing */
+  var density = 1;
+  var MAX_CELLS = 16000;
+  var MIN_COLS = 70;
+  var lastW = 0, lastH = 0;
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    var cw = Math.max(240, cvs.clientWidth || window.innerWidth);
+    var chh = Math.max(240, cvs.clientHeight || window.innerHeight);
+    lastW = cvs.clientWidth; lastH = cvs.clientHeight;
+    cvs.width = Math.floor(cw * DPR);
+    cvs.height = Math.floor(chh * DPR);
+
+    var rows = Math.max(26, Math.round(52 * density));
+    var th = Math.min(chh / rows, (cw / MIN_COLS) / 0.58);
+    for (var guard = 0; guard < 24; guard++) {
+      TH = Math.max(7, Math.round(th * DPR));
+      TW = Math.max(4, Math.round(th * 0.58 * DPR));
+      COLS = Math.ceil(cvs.width / TW);
+      ROWS = Math.ceil(cvs.height / TH);
+      if (COLS * ROWS <= MAX_CELLS) break;
+      th *= 1.08;
+    }
+
+    chBuf = new Int16Array(COLS * ROWS);
+    colc.width = COLS;
+    colc.height = ROWS;
+    cimg = cctx.createImageData(COLS, ROWS);
+    cdat = cimg.data;
+    buildAtlas();
+    allocSample();
+  }
+
+  /* --------------------------------------------------------- loop */
+  var paused = false, prev = 0, cost = 16, tuned = 0, frames = 0;
+
+  function loop(now) {
+    requestAnimationFrame(loop);
+    if (cvs.clientWidth && (cvs.clientWidth !== lastW || cvs.clientHeight !== lastH)) resize();
+    if (!prev) prev = now;
+    var dt = Math.min(0.1, (now - prev) / 1000);
+    if (now - prev < 32) return;
+    prev = now;
+    if (!paused) T += dt;
+
+    var t0 = performance.now();
+    var live = false;
+    if (hasClip && vid.readyState >= 2) live = fillFromVideo();
+    if (!live) fillPlaceholder(T);
+    render();
+    reportSource(live);
+    cost = cost * 0.9 + (performance.now() - t0) * 0.1;
+
+    frames++;
+    if (cost > 42 && frames > 60 && tuned < 2) {
+      tuned++;
+      if (LIC > 5) LIC = 5;
+      else { density = Math.max(0.6, density - 0.15); resize(); }
+    }
+  }
+
+  /* A silent black frame is indistinguishable from a broken one, so say
+     what the source is actually giving us. */
+  var diagAt = 0;
+  function reportSource(live) {
+    if (!diagEl) return;
+    var now = performance.now();
+    if (now - diagAt < 400) return;       /* by clock, not frame count:
+                                             a throttled page draws rarely */
+    diagAt = now;
+    if (!hasClip) { diagEl.textContent = 'pattern'; return; }
+    var what = camStream ? 'camera' : 'file';
+    if (!live) {
+      diagEl.textContent = what + ' — no frames (readyState ' + vid.readyState + ')';
+      return;
+    }
+    var dark = meanL < 0.012;
+    diagEl.textContent = what + ' ' + vid.videoWidth + '×' + vid.videoHeight +
+      ' · rs' + vid.readyState + ' · lum ' + meanL.toFixed(2) +
+      (dark ? ' · frame is black' : '');
+  }
+
+  /* ------------------------------------------------------ controls */
+  var drop = document.getElementById('drop');
+  var bar = document.getElementById('bar');
+  var fileInput = document.getElementById('file');
+  var nameEl = document.getElementById('name');
+  var diagEl = document.getElementById('diag');
+  var playBtn = document.getElementById('play');
+  var camBtn = document.getElementById('cam');
+  var flipBtn = document.getElementById('flip');
+  var camOpenBtn = document.getElementById('camOpen');
+  var mixEl = document.getElementById('mix'), mixV = document.getElementById('mixv');
+  var satEl = document.getElementById('sat'), satV = document.getElementById('satv');
+  var denEl = document.getElementById('den'), denV = document.getElementById('denv');
+  var url = null;
+
+  /* The camera needs a secure context, which a page opened straight off
+     disk is not, and the published artifact's sandbox refuses it outright.
+     So the control only exists where it can actually work. */
+  function camAvailable() {
+    if (!window.isSecureContext) return false;                  /* file:// */
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) return false;
+    /* The published artifact is https, so the two checks above pass there
+       and the button would appear but never work.  A cross-origin frame
+       without an allow="camera" attribute is refused silently, so ask the
+       permissions policy, and fall back to "are we framed at all". */
+    var fp = document.featurePolicy || document.permissionsPolicy;
+    if (fp && typeof fp.allowsFeature === 'function') {
+      try { return fp.allowsFeature('camera'); } catch (e) { /* fall through */ }
+    }
+    try { return window.self === window.top; } catch (e) { return false; }
+  }
+
+  function stopCam() {
+    if (!camStream) return;
+    camStream.getTracks().forEach(function (t) { t.stop(); });
+    camStream = null;
+    vid.srcObject = null;
+  }
+
+  function startCam() {
+    navigator.mediaDevices.getUserMedia({
+      /* facingMode as a plain constraint, not "exact": a laptop with one
+         webcam ignores it rather than failing */
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    }).then(function (s) {
+      stopCam();
+      if (url) { URL.revokeObjectURL(url); url = null; }
+      camStream = s;
+      vid.removeAttribute('src');   /* src="" would load the page as media */
+      vid.srcObject = s;
+      vid.play().catch(function () {});
+      hasClip = true;
+      paused = false;
+      playBtn.textContent = 'Pause';
+      nameEl.textContent = 'camera';
+      camBtn.textContent = 'Stop camera';
+      flipBtn.hidden = false;
+      drop.classList.add('gone');
+    }).catch(function (e) {
+      /* a refusal is an answer, not a failure: say so and carry on */
+      nameEl.textContent = 'camera unavailable (' + ((e && e.name) || 'error') + ')';
+    });
+  }
+
+  function endCam() {
+    stopCam();
+    hasClip = false;
+    camBtn.textContent = 'Camera';
+    flipBtn.hidden = true;
+    nameEl.textContent = 'no clip — showing test pattern';
+  }
+
+  function openFile(f) {
+    if (!f) return;
+    stopCam();
+    camBtn.textContent = 'Camera';
+    if (url) URL.revokeObjectURL(url);
+    url = URL.createObjectURL(f);
+    vid.src = url;
+    vid.play().catch(function () { /* a still frame is fine */ });
+    hasClip = true;
+    paused = false;
+    playBtn.textContent = 'Pause';
+    nameEl.textContent = f.name;
+    drop.classList.add('gone');
+  }
+
+  document.getElementById('open').addEventListener('click', function () { fileInput.click(); });
+  document.getElementById('pick').addEventListener('click', function () { fileInput.click(); });
+  fileInput.addEventListener('change', function () { openFile(fileInput.files && fileInput.files[0]); });
+
+  playBtn.addEventListener('click', function () {
+    paused = !paused;
+    playBtn.textContent = paused ? 'Play' : 'Pause';
+    if (hasClip) { if (paused) vid.pause(); else vid.play().catch(function () {}); }
+  });
+
+  if (camAvailable()) {
+    camBtn.hidden = false;
+    camOpenBtn.hidden = false;
+    camBtn.addEventListener('click', function () {
+      if (camStream) endCam(); else startCam();
+    });
+    camOpenBtn.addEventListener('click', startCam);
+    flipBtn.addEventListener('click', function () {
+      facing = facing === 'user' ? 'environment' : 'user';
+      if (camStream) startCam();            /* reopen on the other lens */
+    });
+  }
+
+  mixEl.addEventListener('input', function () {
+    MIX = mixEl.value / 100;
+    mixV.textContent = mixEl.value;
+  });
+  satEl.addEventListener('input', function () {
+    SAT = satEl.value / 100;
+    satV.textContent = satEl.value;
+  });
+  denEl.addEventListener('input', function () {
+    denV.textContent = denEl.value;
+    density = denEl.value / 100;
+    resize();
+  });
+
+  window.addEventListener('dragover', function (e) {
+    e.preventDefault();
+    drop.classList.add('over');
+    drop.classList.remove('gone');
+  });
+  window.addEventListener('dragleave', function (e) {
+    if (e.relatedTarget) return;
+    drop.classList.remove('over');
+    if (hasClip) drop.classList.add('gone');
+  });
+  window.addEventListener('drop', function (e) {
+    e.preventDefault();
+    drop.classList.remove('over');
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) openFile(f); else if (hasClip) drop.classList.add('gone');
+  });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.target && /^(INPUT|BUTTON|TEXTAREA)$/.test(e.target.tagName)) return;
+    if (e.code === 'Space') { playBtn.click(); e.preventDefault(); }
+    else if (e.key === 'h') bar.classList.toggle('hidden');
+    else if (e.key === 'o') fileInput.click();
+  });
+
+  var rt = 0;
+  function scheduleResize() {
+    if (cvs.clientWidth === lastW && cvs.clientHeight === lastH) return;
+    clearTimeout(rt);
+    rt = setTimeout(resize, 140);
+  }
+  window.addEventListener('resize', scheduleResize);
+  if (window.ResizeObserver) new ResizeObserver(scheduleResize).observe(cvs);
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
